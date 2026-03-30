@@ -1,0 +1,2 @@
+# Atalhos.py
+atalhos
