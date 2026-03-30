@@ -1,0 +1,1035 @@
+import os
+import json
+import uuid
+import threading
+import sys
+import time
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, simpledialog, messagebox, filedialog
+import webbrowser
+import subprocess
+
+import keyboard
+import pyperclip
+from pystray import Icon, MenuItem, Menu
+from PIL import Image, ImageDraw
+
+# ---------------- CONFIGURAÇÃO INICIAL ---------------- #
+APP_NAME = "HelpDeskKauan" # <<< ADICIONADO
+BASE_DIR = os.path.join(os.environ['APPDATA'], APP_NAME) # <<< ALTERADO
+os.makedirs(BASE_DIR, exist_ok=True)
+
+DATA_FILE = os.path.join(BASE_DIR, "atalhos.json")
+VAR_FILE = os.path.join(BASE_DIR, "variaveis.json")
+FOLDERS_FILE = os.path.join(BASE_DIR, "pastas.json")
+
+default_vars = {"{nome}": "", "{email}": "", "{contato}": ""}
+default_folders = [{"id": "root", "nome": "help", "parent_id": None, "gatilho": "\\help"}]
+
+for file_path, default_content in [(DATA_FILE, []), (VAR_FILE, default_vars), (FOLDERS_FILE, default_folders)]:
+    if not os.path.exists(file_path):
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(default_content, f, ensure_ascii=False, indent=2)
+
+GATILHO_PREFIX = "\\"
+
+custom_variables = {}
+folders_list = []
+registered_listeners = {}
+
+# ---------------- HELPERS ---------------- #
+def load_variables():
+    global custom_variables
+    try:
+        with open(VAR_FILE, "r", encoding="utf-8") as f:
+            custom_variables = json.load(f)
+    except Exception:
+        custom_variables = default_vars.copy()
+    for k, v in default_vars.items():
+        if k not in custom_variables:
+            custom_variables[k] = v
+
+def save_variables():
+    with open(VAR_FILE, "w", encoding="utf-8") as f:
+        json.dump(custom_variables, f, ensure_ascii=False, indent=2)
+
+def load_folders():
+    global folders_list
+    try:
+        with open(FOLDERS_FILE, "r", encoding="utf-8") as f:
+            folders_list = json.load(f)
+    except Exception:
+        folders_list = default_folders.copy()
+    if not folders_list:
+        folders_list = default_folders.copy()
+    return folders_list
+
+
+def save_folders(folders):
+    global folders_list
+    folders_list = folders
+    with open(FOLDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(folders_list, f, ensure_ascii=False, indent=2)
+
+def load_data():
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            changed = False
+            for item in data:
+                # Conversão do formato antigo (is_command) para o novo (type)
+                if 'is_command' in item:
+                    if item['is_command']:
+                        item['type'] = 'open'
+                    else:
+                        item['type'] = 'text'
+                    del item['is_command']
+                    changed = True
+                
+                item.setdefault('type', 'text')
+
+                if "id" not in item:
+                    item["id"] = str(uuid.uuid4())
+                    changed = True
+                if "pasta_id" not in item:
+                    item["pasta_id"] = "root"
+                    changed = True
+            if changed:
+                save_data(data)
+            return data
+    except Exception:
+        return []
+
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def check_mandatory_variables(parent):
+    load_variables()
+    while True:
+        empty = [v for v in ["{nome}", "{email}", "{contato}"] if not custom_variables.get(v)]
+        if not empty:
+            break
+        for var in empty:
+            val = simpledialog.askstring("Obrigatório", f"Preencha a variável {var}", parent=parent)
+            if val is None or val.strip() == "":
+                messagebox.showinfo("Obrigatório", "Você deve preencher a variável.", parent=parent)
+            else:
+                custom_variables[var] = val.strip()
+        save_variables()
+
+# ---------------- EXPANSÃO E EXECUÇÃO ---------------- #
+def expand_text(text):
+    now = datetime.now()
+    text = text.replace("{data}", now.strftime("%d/%m/%Y"))
+    text = text.replace("{hora}", now.strftime("%H:%M:%S"))
+    for var, val in custom_variables.items():
+        text = text.replace(var, val)
+    try:
+        text = text.replace("{clipboard}", pyperclip.paste() or "")
+    except Exception:
+        text = text.replace("{clipboard}", "")
+    return text
+
+def perform_replace_and_paste(trigger_len, expansion):
+    try:
+        for _ in range(trigger_len + 1):
+            keyboard.press_and_release("backspace")
+            time.sleep(0.005)
+        old_clip = ""
+        try:
+            old_clip = pyperclip.paste()
+        except Exception: old_clip = ""
+        try:
+            new_text = expand_text(expansion)
+            pyperclip.copy(new_text)
+            time.sleep(0.03)
+            keyboard.press_and_release("ctrl+v")
+            time.sleep(0.03)
+        finally:
+            try:
+                pyperclip.copy(old_clip)
+            except Exception: pass
+    except Exception as e:
+        print(f"Erro ao expandir texto: {e}")
+
+def execute_open_command(trigger_len, command):
+    try:
+        if trigger_len > 0:
+            for _ in range(trigger_len + 1):
+                keyboard.press_and_release("backspace")
+                time.sleep(0.005)
+        
+        expanded_command = expand_text(command).strip()
+
+        if expanded_command.lower().startswith(('http://', 'https://')):
+            webbrowser.open(expanded_command)
+        else:
+            os.startfile(expanded_command)
+    except Exception as e:
+        print(f"Erro ao abrir '{command}': {e}")
+        messagebox.showerror("Erro de Execução", f"Não foi possível abrir:\n{command}\n\nErro: {e}")
+
+def execute_shell_command(trigger_len, command, as_admin=False):
+    try:
+        if trigger_len > 0:
+            for _ in range(trigger_len + 1):
+                keyboard.press_and_release("backspace")
+                time.sleep(0.005)
+
+        expanded_command = expand_text(command)
+        
+        if as_admin:
+            # Combina o comando do usuário com '& pause' para manter a janela aberta e ver o resultado
+            final_command_to_run = f'{expanded_command} & pause'
+            # Usa PowerShell para pedir elevação (UAC prompt) e executar o comando no cmd
+            # O argumento /k mantém a janela do cmd aberta após o comando
+            subprocess.Popen(f'powershell -Command "Start-Process cmd -ArgumentList \'/c, {final_command_to_run}\' -Verb RunAs"', 
+                             shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            subprocess.Popen(expanded_command, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception as e:
+        print(f"Erro ao executar comando de terminal '{command}': {e}")
+        messagebox.showerror("Erro de Execução", f"Não foi possível executar o comando de terminal:\n{command}\n\nErro: {e}")
+
+def padroniza_gatilho(trigger):
+    trigger = (trigger or "").strip()
+    if not trigger:
+        return trigger
+    if not trigger.startswith(GATILHO_PREFIX):
+        trigger = GATILHO_PREFIX + trigger
+    return trigger
+
+def register_shortcut(item):
+    trigger = padroniza_gatilho(item.get("gatilho", ""))
+    if not trigger:
+        return
+    if trigger in registered_listeners:
+        try: keyboard.remove_word_listener(registered_listeners[trigger])
+        except Exception: pass
+        registered_listeners.pop(trigger, None)
+
+    def on_word():
+        f = next((x for x in folders_list if x.get("gatilho") and padroniza_gatilho(x.get("gatilho")) == trigger), None)
+        
+        item_type = item.get('type', 'text')
+        content = item.get("texto", "")
+        trigger_len = len(trigger)
+
+        if f:
+            threading.Thread(target=delete_trigger_and_show_popup, args=(trigger_len, f["id"]), daemon=True).start()
+        elif item_type == 'open':
+            threading.Thread(target=execute_open_command, args=(trigger_len, content), daemon=True).start()
+        elif item_type == 'shell':
+            threading.Thread(target=execute_shell_command, args=(trigger_len, content, False), daemon=True).start()
+        elif item_type == 'shell_admin':
+            threading.Thread(target=execute_shell_command, args=(trigger_len, content, True), daemon=True).start()
+        else: # 'text'
+            threading.Thread(target=perform_replace_and_paste, args=(trigger_len, content), daemon=True).start()
+
+    handler = keyboard.add_word_listener(trigger, on_word, triggers=["space"], match_suffix=True)
+    registered_listeners[trigger] = handler
+    return handler
+
+def unregister_shortcut_by_trigger(trigger):
+    trigger = padroniza_gatilho(trigger)
+    handler = registered_listeners.get(trigger)
+    if handler:
+        try: keyboard.remove_word_listener(handler)
+        except Exception: pass
+        registered_listeners.pop(trigger, None)
+
+def unregister_all_shortcuts():
+    for trig, handler in list(registered_listeners.items()):
+        try: keyboard.remove_word_listener(handler)
+        except Exception: pass
+    registered_listeners.clear()
+
+# ---------------- PASTAS COM GATILHO OPCIONAL ---------------- #
+def delete_trigger_and_show_popup(trigger_len, folder_id):
+    try:
+        for _ in range(trigger_len + 1):
+            keyboard.press_and_release("backspace")
+            time.sleep(0.005)
+        show_folder_popup(folder_id)
+    except Exception as e:
+        print(f"Erro em delete_trigger_and_show_popup: {e}")
+
+def register_folder_trigger(folder):
+    gatilho = padroniza_gatilho(folder.get("gatilho", ""))
+    if not gatilho:
+        return
+    if gatilho in registered_listeners:
+        try: keyboard.remove_word_listener(registered_listeners[gatilho])
+        except Exception: pass
+        registered_listeners.pop(gatilho, None)
+
+    def on_word():
+        threading.Thread(target=delete_trigger_and_show_popup, args=(len(gatilho), folder["id"]), daemon=True).start()
+
+    handler = keyboard.add_word_listener(gatilho, on_word, triggers=["space"], match_suffix=True)
+    registered_listeners[gatilho] = handler
+    return handler
+
+# ---------------- GUI ---------------- #
+class TextExpanderApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Atalhos de Texto Kauan")
+        self.root.geometry("950x520")
+        
+        self.full_reload()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.hide)
+
+        self.tree = ttk.Treeview(root)
+        self.tree["columns"] = ("gatilho", "descricao")
+        self.tree.heading("#0", text="Pasta / Atalho")
+        self.tree.heading("gatilho", text="Gatilho")
+        self.tree.heading("descricao", text="Descrição")
+        self.tree.column("gatilho", width=140)
+        self.tree.column("descricao", width=420)
+        self.tree.pack(fill="both", expand=True, padx=6, pady=6)
+        self.tree.bind("<Double-1>", self.on_double_click_tree)
+
+        btn_fr = ttk.Frame(root)
+        btn_fr.pack(fill="x", pady=4, padx=4)
+
+        buttons = [
+            ("Criar Pasta", self.create_folder),
+            ("Mover Pasta", self.move_folder),
+            ("Excluir Pasta", self.delete_folder),
+            ("Adicionar Atalho", self.add_item),
+            ("Editar Atalho", self.edit_item),
+            ("Mover Atalho", self.move_item),
+            ("Remover Atalho", self.remove_item),
+            ("Editar Variáveis", lambda: edit_custom_variables(self.root)),
+            ("Importar/Exportar", self.open_import_export_window)
+        ]
+        for txt, cmd in buttons:
+            ttk.Button(btn_fr, text=txt, command=cmd).pack(side="left", padx=4)
+        
+        self.update_tree()
+
+    def on_double_click_tree(self, event):
+        sel = self.tree.selection()
+        if not sel: return
+        iid = sel[0]
+        if iid.startswith("item:"):
+            self.edit_item()
+        elif iid.startswith("folder:"):
+            self.edit_trigger()
+
+
+    def full_reload(self):
+        unregister_all_shortcuts()
+        self.data = load_data()
+        load_folders()
+        load_variables()
+        for item in self.data:
+            register_shortcut(item)
+        for folder in folders_list:
+            if folder.get("gatilho"):
+                register_folder_trigger(folder)
+        if hasattr(self, 'tree'):
+             self.update_tree()
+
+    def open_import_export_window(self):
+        create_import_export_window(self.root, self.full_reload)
+
+    def show(self):
+        self.root.deiconify()
+        self.root.lift()
+
+    def hide(self):
+        self.root.withdraw()
+
+    def update_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        folders_dict = {f['id']: f for f in folders_list}
+
+        def add_folder_recursive(fid, parent_iid=""):
+            folder = folders_dict.get(fid)
+            if not folder: return
+            iid = f"folder:{fid}"
+            node = self.tree.insert(parent_iid, "end", iid=iid, text=folder['nome'] + (f"  [{folder.get('gatilho')}]" if folder.get('gatilho') else ""), open=True)
+            for f in [x for x in folders_list if x['parent_id'] == fid]:
+                add_folder_recursive(f['id'], node)
+            for item in sorted([i for i in self.data if i['pasta_id'] == fid], key=lambda x: x.get('descricao', '').lower()):
+                desc = item.get("descricao", "")
+                item_type = item.get("type", "text")
+                if item_type == "open":
+                    desc = f"[Abrir] {desc}"
+                elif item_type == "shell":
+                    desc = f"[Comando] {desc}"
+                elif item_type == "shell_admin":
+                    desc = f"[Admin] {desc}"
+                self.tree.insert(node, "end", iid=f"item:{item['id']}", values=(item.get("gatilho",""), desc))
+        
+        if "root" in folders_dict:
+            add_folder_recursive("root")
+
+    def select_folder_menu(self, title, default="root"):
+        menu_win = tk.Toplevel(self.root)
+        menu_win.title(title)
+        menu_win.geometry("400x300")
+        tree = ttk.Treeview(menu_win)
+        tree.pack(fill="both", expand=True)
+        folders_dict = {f['id']: f for f in folders_list}
+
+        def add_folder_recursive(fid, parent_iid=""):
+            folder = folders_dict.get(fid)
+            if not folder: return
+            iid = f"folder:{fid}"
+            node = tree.insert(parent_iid, "end", iid=iid, text=folder['nome'], open=True)
+            for f in [x for x in folders_list if x['parent_id'] == fid]:
+                add_folder_recursive(f['id'], node)
+        
+        if "root" in folders_dict:
+            add_folder_recursive("root")
+        selected = {}
+
+        def on_select():
+            sel = tree.selection()
+            if sel and sel[0].startswith("folder:"):
+                selected["id"] = sel[0].split("folder:")[1]
+                menu_win.destroy()
+
+        ttk.Button(menu_win, text="Selecionar", command=on_select).pack(side="left", padx=4, pady=4)
+        ttk.Button(menu_win, text="Cancelar", command=menu_win.destroy).pack(side="left", padx=4, pady=4)
+        menu_win.grab_set()
+        menu_win.wait_window()
+        return selected.get("id")
+
+    def create_folder(self):
+        parent_id = self.select_folder_menu("Selecionar pasta pai")
+        if parent_id is None: return
+        nome = simpledialog.askstring("Nova pasta", "Nome da nova pasta:", parent=self.root)
+        if not nome: return
+        gatilho = simpledialog.askstring("Gatilho", "Gatilho opcional (ex: \\pasta):", parent=self.root) or ""
+        gatilho = padroniza_gatilho(gatilho)
+        nova = {"id": str(uuid.uuid4()), "nome": nome, "parent_id": parent_id, "gatilho": gatilho}
+        folders_list.append(nova)
+        save_folders(folders_list)
+        if gatilho:
+            register_folder_trigger(nova)
+        self.update_tree()
+
+    def move_folder(self):
+        folder_ids = [f['id'] for f in folders_list if f['id'] != "root"]
+        sel = self.select_folder_menu("Selecione a pasta a mover")
+        if sel not in folder_ids: return
+        new_parent = self.select_folder_menu("Selecione a nova pasta pai")
+        if not new_parent or new_parent == sel: return
+        for f in folders_list:
+            if f['id'] == sel:
+                f['parent_id'] = new_parent
+                break
+        save_folders(folders_list)
+        self.update_tree()
+
+    def delete_folder(self):
+        folder_ids = [f['id'] for f in folders_list if f['id'] != "root"]
+        sel = self.select_folder_menu("Selecione a pasta a excluir")
+        if sel not in folder_ids: return
+        if not messagebox.askyesno("Confirmar", "Isso excluirá a pasta e TODOS os atalhos dentro dela. Deseja continuar?", parent=self.root):
+            return
+
+        def remove_rec(fid):
+            children = [f['id'] for f in folders_list if f['parent_id'] == fid]
+            for c in children:
+                remove_rec(c)
+            self.data[:] = [i for i in self.data if i['pasta_id'] != fid]
+            folders_list[:] = [f for f in folders_list if f['id'] != fid]
+
+        remove_rec(sel)
+        save_data(self.data)
+        save_folders(folders_list)
+        self.full_reload()
+        
+    def add_item(self):
+        pasta_id = self.select_folder_menu("Selecione a pasta destino")
+        if pasta_id is None: return
+
+        editor = ShortcutEditorWindow(self.root)
+        new_data = editor.show()
+
+        if new_data:
+            new_item = {
+                "id": str(uuid.uuid4()),
+                "pasta_id": pasta_id,
+                "gatilho": padroniza_gatilho(new_data.get("gatilho")),
+                "descricao": new_data.get("descricao"),
+                "texto": new_data.get("texto"),
+                "type": new_data.get("type")
+            }
+            self.data.append(new_item)
+            register_shortcut(new_item)
+            save_data(self.data)
+            self.update_tree()
+
+    def edit_item(self):
+        sel = self.tree.selection()
+        if not sel or not sel[0].startswith("item:"): 
+            messagebox.showinfo("Aviso", "Por favor, selecione um atalho para editar.", parent=self.root)
+            return
+        
+        item = self._get_item_by_iid(sel[0])
+        if not item: return
+
+        editor = ShortcutEditorWindow(self.root, item_data=item)
+        updated_data = editor.show()
+
+        if updated_data:
+            unregister_shortcut_by_trigger(item["gatilho"])
+            
+            item["gatilho"] = padroniza_gatilho(updated_data.get("gatilho"))
+            item["descricao"] = updated_data.get("descricao")
+            item["texto"] = updated_data.get("texto")
+            item["type"] = updated_data.get("type")
+            
+            register_shortcut(item)
+            save_data(self.data)
+            self.update_tree()
+
+    def edit_trigger(self):
+        sel = self.tree.selection()
+        if not sel or not sel[0].startswith("folder:"):
+            messagebox.showinfo("Aviso", "Isto é para editar o gatilho de uma pasta. Selecione uma pasta.", parent=self.root)
+            return
+        
+        folder_id = sel[0].split("folder:")[1]
+        if folder_id == "root":
+            messagebox.showinfo("Aviso", "A pasta raiz não pode ter seu nome ou gatilho editado por aqui.", parent=self.root)
+            return
+
+        folder = next((f for f in folders_list if f["id"] == folder_id), None)
+        if not folder: return
+
+        novo_gatilho = simpledialog.askstring("Editar Gatilho da Pasta", "Novo gatilho (vazio = sem gatilho):", 
+                                            parent=self.root, initialvalue=folder.get("gatilho", ""))
+        if novo_gatilho is None: return
+
+        old_gatilho = padroniza_gatilho(folder.get("gatilho", ""))
+        if old_gatilho:
+            unregister_shortcut_by_trigger(old_gatilho)
+
+        folder["gatilho"] = padroniza_gatilho(novo_gatilho)
+        save_folders(folders_list)
+        if folder["gatilho"]:
+            register_folder_trigger(folder)
+        self.update_tree()
+
+    def remove_item(self):
+        sel = self.tree.selection()
+        if not sel or not sel[0].startswith("item:"): 
+            messagebox.showinfo("Aviso", "Por favor, selecione um atalho para remover.", parent=self.root)
+            return
+        
+        if messagebox.askyesno("Confirmar", "Remover atalho?", parent=self.root):
+            item = self._get_item_by_iid(sel[0])
+            if item:
+                self.data.remove(item)
+                unregister_shortcut_by_trigger(item["gatilho"])
+                save_data(self.data)
+                self.update_tree()
+
+    def move_item(self):
+        sel = self.tree.selection()
+        if not sel or not sel[0].startswith("item:"):
+            messagebox.showinfo("Aviso", "Por favor, selecione um atalho para mover.", parent=self.root)
+            return
+
+        item = self._get_item_by_iid(sel[0])
+        if not item: return
+        pasta_id = self.select_folder_menu("Selecione a nova pasta de destino", default=item['pasta_id'])
+        if not pasta_id: return
+        item['pasta_id'] = pasta_id
+        save_data(self.data)
+        self.update_tree()
+
+    def _get_item_by_iid(self, iid):
+        item_id = iid.split("item:")[1]
+        return next((x for x in self.data if x["id"] == item_id), None)
+
+
+
+
+
+# ---------------- JANELA DE EDIÇÃO DE ATALHO ---------------- #
+class ShortcutEditorWindow:
+    def __init__(self, parent, item_data=None):
+        self.parent = parent
+        self.item_data = item_data or {}
+        self.result = None
+
+        self.win = tk.Toplevel(parent)
+        self.win.title("Editar Atalho" if item_data else "Novo Atalho")
+        self.win.geometry("600x480")
+        self.win.transient(parent)
+
+        self.gatilho_var = tk.StringVar(value=self.item_data.get("gatilho", ""))
+        self.descricao_var = tk.StringVar(value=self.item_data.get("descricao", ""))
+        self.type_var = tk.StringVar(value=self.item_data.get("type", "text"))
+
+        main_frame = ttk.Frame(self.win, padding="10")
+        main_frame.pack(fill="both", expand=True)
+
+        ttk.Label(main_frame, text="Gatilho (ex: \\ex)").pack(anchor="w")
+        ttk.Entry(main_frame, textvariable=self.gatilho_var).pack(fill="x", pady=(0, 10))
+
+        ttk.Label(main_frame, text="Descrição (Opcional)").pack(anchor="w")
+        ttk.Entry(main_frame, textvariable=self.descricao_var).pack(fill="x", pady=(0, 10))
+        
+        type_frame = ttk.LabelFrame(main_frame, text="Tipo de Atalho", padding="10")
+        type_frame.pack(fill="x", pady=5)
+        
+        ttk.Radiobutton(type_frame, text="Texto", variable=self.type_var, value="text", command=self.toggle_content_label).pack(side="left", padx=5)
+        ttk.Radiobutton(type_frame, text="Abrir Arquivo/Site", variable=self.type_var, value="open", command=self.toggle_content_label).pack(side="left", padx=5)
+        ttk.Radiobutton(type_frame, text="Comando", variable=self.type_var, value="shell", command=self.toggle_content_label).pack(side="left", padx=5)
+        ttk.Radiobutton(type_frame, text="Comando (Admin)", variable=self.type_var, value="shell_admin", command=self.toggle_content_label).pack(side="left", padx=5)
+
+
+        self.content_label = ttk.Label(main_frame)
+        self.content_label.pack(anchor="w", pady=(10, 0))
+        
+        self.texto_widget = tk.Text(main_frame, height=10)
+        self.texto_widget.pack(fill="both", expand=True)
+        self.texto_widget.insert("1.0", self.item_data.get("texto", ""))
+        
+        self.toggle_content_label()
+
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill="x", pady=(10, 0))
+        ttk.Button(btn_frame, text="Salvar", command=self.on_save).pack(side="right")
+        ttk.Button(btn_frame, text="Cancelar", command=self.win.destroy).pack(side="right", padx=5)
+
+    def toggle_content_label(self):
+        type_labels = {
+            "text": "Texto do atalho:",
+            "open": "Caminho do Arquivo / Site / Pasta:",
+            "shell": "Comando de Terminal (CMD/PowerShell):",
+            "shell_admin": "Comando de Terminal (Como Administrador):"
+        }
+        self.content_label.config(text=type_labels.get(self.type_var.get(), "Conteúdo:"))
+
+    def on_save(self):
+        self.result = {
+            "gatilho": self.gatilho_var.get(),
+            "descricao": self.descricao_var.get(),
+            "texto": self.texto_widget.get("1.0", "end-1c"),
+            "type": self.type_var.get()
+        }
+        self.win.destroy()
+
+    def show(self):
+        self.win.grab_set()
+        self.parent.wait_window(self.win)
+        return self.result
+
+# ... (O restante do código, incluindo LÓGICA DE INICIALIZAÇÃO, IMPORTAR/EXPORTAR, etc., continua aqui)
+# ---------------- LÓGICA DE INICIALIZAÇÃO COM WINDOWS ---------------- #
+STARTUP_FILENAME = "help_desk_shortcuts.bat"
+
+def get_startup_path():
+    return os.path.join(os.environ['APPDATA'], 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+
+def get_shortcut_path():
+    return os.path.join(get_startup_path(), STARTUP_FILENAME)
+
+def is_configured_for_startup():
+    return os.path.exists(get_shortcut_path())
+
+def set_startup_status(enable, parent):
+    shortcut_path = get_shortcut_path()
+    try:
+        if enable:
+            if getattr(sys, 'frozen', False):
+                executable_path = sys.executable
+                command = f'@echo off\nstart "Text Expander" "{executable_path}"'
+            else:
+                python_exe = sys.executable.replace("python.exe", "pythonw.exe")
+                script_path = os.path.abspath(__file__)
+                command = f'@echo off\nstart "Text Expander" "{python_exe}" "{script_path}"'
+            with open(shortcut_path, "w") as f:
+                f.write(command)
+        else:
+            if os.path.exists(shortcut_path):
+                os.remove(shortcut_path)
+    except Exception as e:
+        messagebox.showerror("Erro", f"Falha ao modificar a inicialização com Windows:\n{e}", parent=parent)
+
+
+# ---------------- JANELA DE IMPORTAR/EXPORTAR ---------------- #
+def create_import_export_window(parent, reload_callback):
+    win = tk.Toplevel(parent)
+    win.title("Importar, Exportar e Configurar")
+    win.geometry("400x320")
+    win.transient(parent)
+    win.grab_set()
+
+    main_frame = ttk.Frame(win, padding="10")
+    main_frame.pack(fill="both", expand=True)
+
+    data_frame = ttk.LabelFrame(main_frame, text="Atalhos e Pastas", padding="10")
+    data_frame.pack(fill="x", pady=5)
+    ttk.Button(data_frame, text="Exportar...", command=lambda: export_data(win)).pack(side="left", padx=5)
+    ttk.Button(data_frame, text="Importar...", command=lambda: import_data(win, reload_callback)).pack(side="left", padx=5)
+
+    vars_frame = ttk.LabelFrame(main_frame, text="Variáveis Personalizadas", padding="10")
+    vars_frame.pack(fill="x", pady=5)
+    ttk.Button(vars_frame, text="Exportar...", command=lambda: export_vars(win)).pack(side="left", padx=5)
+    ttk.Button(vars_frame, text="Importar...", command=lambda: import_vars(win)).pack(side="left", padx=5)
+    
+    settings_frame = ttk.LabelFrame(main_frame, text="Configurações", padding="10")
+    settings_frame.pack(fill="x", pady=10)
+    startup_var = tk.BooleanVar(value=is_configured_for_startup())
+    ttk.Checkbutton(settings_frame, text="Iniciar com o Windows", variable=startup_var,
+                    command=lambda: set_startup_status(startup_var.get(), win)).pack(side="left")
+
+    ttk.Button(main_frame, text="Fechar", command=win.destroy).pack(side="bottom", pady=10)
+
+def export_data(parent):
+    file_path = filedialog.asksaveasfilename(
+        parent=parent, title="Salvar Atalhos e Pastas", defaultextension=".json",
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+    )
+    if not file_path: return
+    try:
+        data_to_export = {"folders": load_folders() or [], "shortcuts": load_data() or []}
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data_to_export, f, ensure_ascii=False, indent=2)
+        messagebox.showinfo("Sucesso", "Dados exportados com sucesso!", parent=parent)
+    except Exception as e:
+        messagebox.showerror("Erro", f"Falha ao exportar dados: {e}", parent=parent)
+
+def import_data(parent, reload_callback):
+    if not messagebox.askyesno("Atenção", "Isso substituirá TODAS as suas pastas e atalhos atuais. Um backup será criado. Deseja continuar?", parent=parent):
+        return
+    file_path = filedialog.askopenfilename(
+        parent=parent, title="Abrir arquivo de Atalhos e Pastas",
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+    )
+    if not file_path: return
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            imported_data = json.load(f)
+        if "folders" not in imported_data or "shortcuts" not in imported_data:
+            raise ValueError("Arquivo JSON inválido.")
+        
+        ts = int(time.time())
+        os.rename(FOLDERS_FILE, f"{FOLDERS_FILE}_{ts}.bak")
+        os.rename(DATA_FILE, f"{DATA_FILE}_{ts}.bak")
+
+        save_folders(imported_data["folders"])
+        save_data(imported_data["shortcuts"])
+
+        reload_callback()
+        messagebox.showinfo("Sucesso", "Dados importados! O aplicativo foi recarregado.", parent=parent)
+    except Exception as e:
+        messagebox.showerror("Erro", f"Falha ao importar dados: {e}", parent=parent)
+
+def export_vars(parent):
+    file_path = filedialog.asksaveasfilename(
+        parent=parent, title="Salvar Variáveis", defaultextension=".json",
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+    )
+    if not file_path: return
+    try:
+        load_variables()
+        vars_to_export = {k: v for k, v in custom_variables.items() if k not in default_vars}
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(vars_to_export, f, ensure_ascii=False, indent=2)
+        messagebox.showinfo("Sucesso", "Variáveis exportadas com sucesso!", parent=parent)
+    except Exception as e:
+        messagebox.showerror("Erro", f"Falha ao exportar variáveis: {e}", parent=parent)
+
+def import_vars(parent):
+    file_path = filedialog.askopenfilename(
+        parent=parent, title="Abrir arquivo de Variáveis",
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+    )
+    if not file_path: return
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            imported_vars = json.load(f)
+        load_variables()
+        for k, v in imported_vars.items():
+            if k not in default_vars:
+                custom_variables[k] = v
+        save_variables()
+        messagebox.showinfo("Sucesso", "Variáveis importadas e mescladas com sucesso!", parent=parent)
+    except Exception as e:
+        messagebox.showerror("Erro", f"Falha ao importar variáveis: {e}", parent=parent)
+
+# ---------------- VARIÁVEIS ---------------- #
+def edit_custom_variables(root):
+    load_variables()
+    win = tk.Toplevel(root)
+    win.title("Editar Variáveis")
+    win.geometry("450x350")
+    main_frame = ttk.Frame(win, padding="10")
+    main_frame.pack(fill="both", expand=True)
+
+    tree = ttk.Treeview(main_frame, columns=("value",), show="tree headings")
+    tree.heading("#0", text="Variável")
+    tree.heading("value", text="Valor")
+    tree.column("#0", width=150)
+    tree.pack(fill="both", expand=True)
+
+    def populate_tree():
+        tree.delete(*tree.get_children())
+        defaults = ["{nome}", "{email}", "{contato}"]
+        for var in defaults:
+            if var in custom_variables:
+                tree.insert("", "end", iid=var, text=var, values=(custom_variables[var],), tags=('default',))
+        for var, val in sorted(custom_variables.items()):
+            if var not in defaults:
+                tree.insert("", "end", iid=var, text=var, values=(val,))
+        tree.tag_configure('default', foreground='gray')
+
+    def add_variable():
+        name = simpledialog.askstring("Nova Variável", "Digite o nome da nova variável (sem chaves):", parent=win)
+        if not (name and name.strip()):
+            return
+        
+        var_name = f"{{{name.strip().replace('{','').replace('}','')}}}"
+        if var_name in custom_variables:
+            messagebox.showerror("Erro", "Esta variável já existe.", parent=win)
+            return
+
+        value = simpledialog.askstring("Valor da Variável", f"Digite o valor para a nova variável {var_name}:", parent=win)
+        
+        custom_variables[var_name] = value if value is not None else ""
+        populate_tree()
+
+    def delete_variable():
+        selected_iid = tree.selection()
+        if not selected_iid:
+            messagebox.showinfo("Aviso", "Selecione uma variável para excluir.", parent=win)
+            return
+        var_name = selected_iid[0]
+        if var_name in ["{nome}", "{email}", "{contato}"]:
+            messagebox.showerror("Erro", "Não é possível excluir as variáveis padrão.", parent=win)
+            return
+        if messagebox.askyesno("Confirmar", f"Tem certeza que deseja excluir a variável {var_name}?", parent=win):
+            del custom_variables[var_name]
+            populate_tree()
+
+    def on_double_click(event):
+        selected_iid = tree.selection()
+        if not selected_iid: return
+        var_name = selected_iid[0]
+        current_val = custom_variables.get(var_name, "")
+        new_val = simpledialog.askstring("Editar Valor", f"Digite o novo valor para {var_name}:",
+                                        initialvalue=current_val, parent=win)
+        if new_val is not None:
+            custom_variables[var_name] = new_val
+            populate_tree()
+
+    def show_variables_help():
+        title = "Ajuda - Variáveis"
+        message = (
+            "Para usar uma variável, digite seu nome (com as chaves {}) no texto de um atalho. "
+            "Ela será substituída pelo valor correspondente.\n\n"
+            "--- Variáveis Dinâmicas (Automáticas) ---\n\n"
+            f"• {{data}}: Insere a data atual (ex: {datetime.now().strftime('%d/%m/%Y')}).\n"
+            f"• {{hora}}: Insere a hora atual (ex: {datetime.now().strftime('%H:%M:%S')}).\n"
+            "• {clipboard}: Insere o conteúdo da área de transferência (Ctrl+C).\n\n"
+            "--- Variáveis Configuráveis (Você preenche) ---\n\n"
+            "• {nome}: Nome do cliente/usuário.\n"
+            "• {email}: Email do cliente/usuário.\n"
+            "• {contato}: Contato (telefone, etc.) do cliente/usuário."
+        )
+        messagebox.showinfo(title, message, parent=win)
+
+    tree.bind("<Double-1>", on_double_click)
+    populate_tree()
+    btn_frame = ttk.Frame(main_frame)
+    btn_frame.pack(fill="x", pady=(10, 0))
+    ttk.Button(btn_frame, text="Criar", command=add_variable).pack(side="left", padx=4)
+    ttk.Button(btn_frame, text="Excluir", command=delete_variable).pack(side="left", padx=4)
+    ttk.Button(btn_frame, text="Ajuda", command=show_variables_help).pack(side="left", padx=4)
+    def save_and_close():
+        save_variables()
+        win.destroy()
+    ttk.Button(btn_frame, text="Salvar e Fechar", command=save_and_close).pack(side="right", padx=4)
+    ttk.Button(btn_frame, text="Cancelar", command=win.destroy).pack(side="right", padx=4)
+    win.transient(root)
+    win.grab_set()
+    root.wait_window(win)
+
+# ---------------- AJUDA INTERATIVA ---------------- #
+def show_help_tree():
+    load_folders()
+    data = load_data()
+    win = tk.Toplevel()
+    win.title("Ajuda - Navegação de Atalhos")
+    win.geometry("600x420")
+    tree = ttk.Treeview(win, columns=("gatilho", "descricao"))
+    tree.heading("#0", text="Pasta / Atalho")
+    tree.heading("gatilho", text="Gatilho")
+    tree.heading("descricao", text="Descrição")
+    tree.column("gatilho", width=120)
+    tree.column("descricao", width=300)
+    tree.pack(fill="both", expand=True)
+    folders_dict = {f['id']: f for f in folders_list}
+    def add_folder_recursive(fid, parent_iid=""):
+        folder = folders_dict.get(fid)
+        if not folder: return
+        iid = f"folder:{fid}"
+        node = tree.insert(parent_iid, "end", iid=iid, text=folder['nome'], open=True)
+        for f in [x for x in folders_list if x['parent_id'] == fid]:
+            add_folder_recursive(f['id'], node)
+        for item in [i for i in data if i['pasta_id'] == fid]:
+            desc = item.get("descricao", "")
+            item_type = item.get("type", "text")
+            if item_type == "open":
+                desc = f"[Abrir] {desc}"
+            elif item_type == "shell":
+                desc = f"[Comando] {desc}"
+            elif item_type == "shell_admin":
+                desc = f"[Admin] {desc}"
+            tree.insert(node, "end", iid=f"item:{item['id']}", values=(item.get("gatilho",""), desc))
+    if "root" in folders_dict:
+        add_folder_recursive("root")
+    def colar_selecionado():
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo("Info", "Selecione um atalho.", parent=win)
+            return
+        iid = sel[0]
+        if iid.startswith("item:"):
+            item_id = iid.split("item:")[1]
+            item = next((x for x in data if x["id"] == item_id), None)
+            if item:
+                item_type = item.get("type", "text")
+                content = item.get("texto", "")
+                win.destroy()
+                time.sleep(0.05)
+                if item_type == "open":
+                    execute_open_command(0, content)
+                elif item_type == "shell":
+                    execute_shell_command(0, content, as_admin=False)
+                elif item_type == "shell_admin":
+                    execute_shell_command(0, content, as_admin=True)
+                else:
+                    texto = expand_text(content)
+                    pyperclip.copy(texto)
+                    keyboard.press_and_release("ctrl+v")
+    tree.bind("<Double-1>", colar_selecionado)
+    btn_fr = ttk.Frame(win)
+    btn_fr.pack(fill="x", pady=6)
+    ttk.Button(btn_fr, text="Colar/Executar Selecionado", command=colar_selecionado).pack(side="left", padx=6)
+    ttk.Button(btn_fr, text="Fechar", command=win.destroy).pack(side="right", padx=6)
+    win.grab_set()
+    win.mainloop()
+
+def show_folder_popup(folder_id):
+    load_folders()
+    data = load_data()
+    win = tk.Toplevel()
+    folder = next((f for f in folders_list if f["id"] == folder_id), None)
+    if not folder: return
+    win.title(f"Pasta: {folder['nome']}")
+    win.geometry("500x400")
+    tree = ttk.Treeview(win, columns=("gatilho", "descricao"))
+    tree.heading("#0", text="Pasta / Atalho")
+    tree.heading("gatilho", text="Gatilho")
+    tree.heading("descricao", text="Descrição")
+    tree.column("gatilho", width=120)
+    tree.column("descricao", width=250)
+    tree.pack(fill="both", expand=True)
+    folders_dict = {f['id']: f for f in folders_list}
+    def add_folder_recursive(fid, parent_iid=""):
+        folder = folders_dict.get(fid)
+        if not folder: return
+        iid = f"folder:{fid}"
+        node = tree.insert(parent_iid, "end", iid=iid, text=folder['nome'], open=True)
+        for f in [x for x in folders_list if x['parent_id'] == fid]:
+            add_folder_recursive(f['id'], node)
+        for item in [i for i in data if i['pasta_id'] == fid]:
+            desc = item.get("descricao", "")
+            item_type = item.get("type", "text")
+            if item_type == "open":
+                desc = f"[Abrir] {desc}"
+            elif item_type == "shell":
+                desc = f"[Comando] {desc}"
+            elif item_type == "shell_admin":
+                desc = f"[Admin] {desc}"
+            tree.insert(node, "end", iid=f"item:{item['id']}", values=(item.get("gatilho",""), desc))
+    if folder_id in folders_dict:
+        add_folder_recursive(folder_id)
+    def colar_selecionado():
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo("Info", "Selecione um atalho.", parent=win)
+            return
+        iid = sel[0]
+        if iid.startswith("item:"):
+            item_id = iid.split("item:")[1]
+            item = next((x for x in data if x["id"] == item_id), None)
+            if item:
+                win.destroy()
+                time.sleep(0.05)
+                item_type = item.get("type", "text")
+                content = item.get("texto", "")
+                if item_type == "open":
+                    execute_open_command(0, content)
+                elif item_type == "shell":
+                    execute_shell_command(0, content, as_admin=False)
+                elif item_type == "shell_admin":
+                    execute_shell_command(0, content, as_admin=True)
+                else:
+                    texto = expand_text(content)
+                    pyperclip.copy(texto)
+                    keyboard.press_and_release("ctrl+v")
+    tree.bind("<Double-1>", colar_selecionado)
+    btn_fr = ttk.Frame(win)
+    btn_fr.pack(fill="x", pady=6)
+    ttk.Button(btn_fr, text="Colar/Executar Selecionado", command=colar_selecionado).pack(side="left", padx=6)
+    ttk.Button(btn_fr, text="Fechar", command=win.destroy).pack(side="right", padx=6)
+    win.grab_set()
+    win.mainloop()
+
+
+# ---------------- TRAY ---------------- #
+# A função create_image() foi removida, pois não será mais usada.
+
+def run_tray(app):
+    def stop_all(icon=None, item=None):
+        unregister_all_shortcuts()
+        try: icon.stop()
+        except Exception: pass
+        try: app.root.destroy()
+        except Exception: pass
+
+    # <<< ALTERAÇÃO AQUI: Carrega a imagem do arquivo
+    try:
+        image = Image.open("icone.ico") 
+    except FileNotFoundError:
+        # Se não encontrar o icone.png, cria um ícone padrão para o programa não quebrar
+        image = Image.new("RGB", (64, 64), "white")
+        d = ImageDraw.Draw(image)
+        d.rectangle([8, 8, 56, 56], fill="black")
+        print("AVISO: Arquivo 'icone.png' não encontrado. Usando ícone padrão.")
+
+
+    icon = Icon("expander", image, menu=Menu( # <<< ALTERAÇÃO AQUI: Usa a imagem carregada
+        MenuItem("Abrir", lambda _: app.show()),
+        MenuItem("Sair", lambda _: stop_all(icon))
+    ))
+    threading.Thread(target=icon.run, daemon=True).start()
+
+# ---------------- MAIN ---------------- #
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    check_mandatory_variables(root)
+    app = TextExpanderApp(root)
+    run_tray(app)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
